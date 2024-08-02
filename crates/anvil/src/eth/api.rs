@@ -14,7 +14,7 @@ use crate::{
         error::{
             BlockchainError, FeeHistoryError, InvalidTransactionError, Result, ToRpcResponseResult,
         },
-        fees::{FeeDetails, FeeHistoryCache},
+        fees::{FeeDetails, FeeHistoryCache, MIN_SUGGESTED_PRIORITY_FEE},
         macros::node_info,
         miner::FixedBlockTimeMiner,
         pool::{
@@ -31,23 +31,29 @@ use crate::{
     revm::primitives::{BlobExcessGasAndPrice, Output},
     ClientFork, LoggingManager, Miner, MiningMode, StorageInfo,
 };
-use alloy_consensus::TxEip4844Variant;
+use alloy_consensus::{transaction::eip4844::TxEip4844Variant, Account, TxEnvelope};
 use alloy_dyn_abi::TypedData;
 use alloy_eips::eip2718::Encodable2718;
 use alloy_network::eip2718::Decodable2718;
-use alloy_primitives::{Address, Bytes, TxHash, TxKind, B256, B64, U256, U64};
+use alloy_primitives::{Address, Bytes, Parity, TxHash, TxKind, B256, B64, U256, U64};
 use alloy_rpc_types::{
+    anvil::{
+        ForkedNetwork, Forking, Metadata, MineOptions, NodeEnvironment, NodeForkConfig, NodeInfo,
+    },
     request::TransactionRequest,
     state::StateOverride,
+    trace::{
+        filter::TraceFilter,
+        geth::{GethDebugTracingCallOptions, GethDebugTracingOptions, GethTrace},
+        parity::LocalizedTransactionTrace,
+    },
     txpool::{TxpoolContent, TxpoolInspect, TxpoolInspectSummary, TxpoolStatus},
     AccessList, AccessListWithGasUsed, Block, BlockId, BlockNumberOrTag as BlockNumber,
-    BlockTransactions, EIP1186AccountProofResponse, FeeHistory, Filter, FilteredParams, Log,
-    Transaction, WithOtherFields,
+    BlockTransactions, EIP1186AccountProofResponse, FeeHistory, Filter, FilteredParams, Index, Log,
+    Transaction,
 };
-use alloy_rpc_types_trace::{
-    geth::{DefaultFrame, GethDebugTracingOptions, GethDefaultTracingOptions, GethTrace},
-    parity::LocalizedTransactionTrace,
-};
+use alloy_serde::WithOtherFields;
+use alloy_signer::Signature;
 use alloy_transport::TransportErrorKind;
 use anvil_core::{
     eth::{
@@ -58,10 +64,7 @@ use anvil_core::{
         },
         EthRequest,
     },
-    types::{
-        AnvilMetadata, EvmMineOptions, ForkedNetwork, Forking, Index, NodeEnvironment,
-        NodeForkConfig, NodeInfo, Work,
-    },
+    types::Work,
 };
 use anvil_rpc::{error::RpcError, response::ResponseResult};
 use foundry_common::provider::ProviderBuilder;
@@ -90,7 +93,7 @@ pub struct EthApi {
     pool: Arc<Pool>,
     /// Holds all blockchain related data
     /// In-Memory only for now
-    pub(super) backend: Arc<backend::mem::Backend>,
+    pub backend: Arc<backend::mem::Backend>,
     /// Whether this node is mining
     is_mining: bool,
     /// available signers
@@ -115,8 +118,6 @@ pub struct EthApi {
     /// The instance ID. Changes on every reset.
     instance_id: Arc<RwLock<B256>>,
 }
-
-// === impl Eth RPC API ===
 
 impl EthApi {
     /// Creates a new instance
@@ -148,12 +149,15 @@ impl EthApi {
         }
     }
 
-    /// Executes the [EthRequest] and returns an RPC [RpcResponse]
+    /// Executes the [EthRequest] and returns an RPC [ResponseResult].
     pub async fn execute(&self, request: EthRequest) -> ResponseResult {
         trace!(target: "rpc::api", "executing eth request");
         match request {
             EthRequest::Web3ClientVersion(()) => self.client_version().to_rpc_result(),
             EthRequest::Web3Sha3(content) => self.sha3(content).to_rpc_result(),
+            EthRequest::EthGetAccount(addr, block) => {
+                self.get_account(addr, block).await.to_rpc_result()
+            }
             EthRequest::EthGetBalance(addr, block) => {
                 self.balance(addr, block).await.to_rpc_result()
             }
@@ -212,6 +216,9 @@ impl EthApi {
                 self.get_proof(addr, keys, block).await.to_rpc_result()
             }
             EthRequest::EthSign(addr, content) => self.sign(addr, content).await.to_rpc_result(),
+            EthRequest::PersonalSign(content, addr) => {
+                self.sign(addr, content).await.to_rpc_result()
+            }
             EthRequest::EthSignTransaction(request) => {
                 self.sign_transaction(*request).await.to_rpc_result()
             }
@@ -235,6 +242,15 @@ impl EthApi {
             }
             EthRequest::EthEstimateGas(call, block, overrides) => {
                 self.estimate_gas(call, block, overrides).await.to_rpc_result()
+            }
+            EthRequest::EthGetRawTransactionByHash(hash) => {
+                self.raw_transaction(hash).await.to_rpc_result()
+            }
+            EthRequest::EthGetRawTransactionByBlockHashAndIndex(hash, index) => {
+                self.raw_transaction_by_block_hash_and_index(hash, index).await.to_rpc_result()
+            }
+            EthRequest::EthGetRawTransactionByBlockNumberAndIndex(num, index) => {
+                self.raw_transaction_by_block_number_and_index(num, index).await.to_rpc_result()
             }
             EthRequest::EthGetTransactionByBlockHashAndIndex(hash, index) => {
                 self.transaction_by_block_hash_and_index(hash, index).await.to_rpc_result()
@@ -266,7 +282,10 @@ impl EthApi {
             EthRequest::EthFeeHistory(count, newest, reward_percentiles) => {
                 self.fee_history(count, newest, reward_percentiles).await.to_rpc_result()
             }
-
+            // non eth-standard rpc calls
+            EthRequest::DebugGetRawTransaction(hash) => {
+                self.raw_transaction(hash).await.to_rpc_result()
+            }
             // non eth-standard rpc calls
             EthRequest::DebugTraceTransaction(tx, opts) => {
                 self.debug_trace_transaction(tx, opts).await.to_rpc_result()
@@ -277,6 +296,7 @@ impl EthApi {
             }
             EthRequest::TraceTransaction(tx) => self.trace_transaction(tx).await.to_rpc_result(),
             EthRequest::TraceBlock(block) => self.trace_block(block).await.to_rpc_result(),
+            EthRequest::TraceFilter(filter) => self.trace_filter(filter).await.to_rpc_result(),
             EthRequest::ImpersonateAccount(addr) => {
                 self.anvil_impersonate_account(addr).await.to_rpc_result()
             }
@@ -434,7 +454,7 @@ impl EthApi {
                     alloy_primitives::Signature::from_scalars_and_parity(
                         B256::with_last_byte(1),
                         B256::with_last_byte(1),
-                        false,
+                        Parity::Parity(false),
                     )
                     .unwrap();
                 return build_typed_transaction(request, nil_signature)
@@ -463,6 +483,19 @@ impl EthApi {
             }
         };
         Ok(block_request)
+    }
+
+    async fn inner_raw_transaction(&self, hash: B256) -> Result<Option<Bytes>> {
+        match self.pool.get_transaction(hash) {
+            Some(tx) => Ok(Some(tx.transaction.encoded_2718().into())),
+            None => match self.backend.transaction_by_hash(hash).await? {
+                Some(tx) => TxEnvelope::try_from(tx.inner)
+                    .map_or(Err(BlockchainError::FailedToDecodeTransaction), |tx| {
+                        Ok(Some(tx.encoded_2718().into()))
+                    }),
+                None => Ok(None),
+            },
+        }
     }
 
     /// Returns the current client version.
@@ -544,12 +577,16 @@ impl EthApi {
     /// Returns the current gas price
     fn eth_gas_price(&self) -> Result<U256> {
         node_info!("eth_gasPrice");
-        self.gas_price()
+        Ok(U256::from(self.gas_price()))
     }
 
     /// Returns the current gas price
-    pub fn gas_price(&self) -> Result<U256> {
-        Ok(U256::from(self.backend.gas_price()))
+    pub fn gas_price(&self) -> u128 {
+        if self.backend.is_eip1559() {
+            self.backend.base_fee().saturating_add(self.lowest_suggestion_tip())
+        } else {
+            self.backend.fees().raw_gas_price()
+        }
     }
 
     /// Returns the excess blob gas and current blob gas price
@@ -562,7 +599,7 @@ impl EthApi {
     ///
     /// Handler for ETH RPC call: `eth_maxPriorityFeePerGas`
     pub fn gas_max_priority_fee_per_gas(&self) -> Result<U256> {
-        Ok(U256::from(self.backend.max_priority_fee_per_gas()))
+        self.max_priority_fee_per_gas()
     }
 
     /// Returns the base fee per blob required to send a EIP-4844 tx.
@@ -622,6 +659,29 @@ impl EthApi {
         }
 
         self.backend.get_balance(address, Some(block_request)).await
+    }
+
+    /// Returns the ethereum account.
+    ///
+    /// Handler for ETH RPC call: `eth_getAccount`
+    pub async fn get_account(
+        &self,
+        address: Address,
+        block_number: Option<BlockId>,
+    ) -> Result<Account> {
+        node_info!("eth_getAccount");
+        let block_request = self.block_request(block_number).await?;
+
+        // check if the number predates the fork, if in fork mode
+        if let BlockRequest::Number(number) = block_request {
+            if let Some(fork) = self.get_fork() {
+                if fork.predates_fork(number) {
+                    return Ok(fork.get_account(address, number).await?)
+                }
+            }
+        }
+
+        self.backend.get_account_at_block(address, Some(block_request)).await
     }
 
     /// Returns content of the storage at given address.
@@ -903,9 +963,10 @@ impl EthApi {
         }
 
         let request = self.build_typed_tx_request(request, nonce)?;
+
         // if the sender is currently impersonated we need to "bypass" signing
         let pending_transaction = if self.is_impersonated(from) {
-            let bypass_signature = self.backend.cheats().bypass_signature();
+            let bypass_signature = self.impersonated_signature(&request);
             let transaction = sign::build_typed_transaction(request, bypass_signature)?;
             self.ensure_typed_transaction_supported(&transaction)?;
             trace!(target : "node", ?from, "eth_sendTransaction: impersonating");
@@ -1195,7 +1256,7 @@ impl EthApi {
         let number = self.backend.ensure_block_number(Some(BlockId::Number(block_number))).await?;
         if let Some(fork) = self.get_fork() {
             if fork.predates_fork_inclusive(number) {
-                return Ok(fork.uncle_by_block_number_and_index(number, idx.into()).await?);
+                return Ok(fork.uncle_by_block_number_and_index(number, idx.into()).await?)
             }
         }
         // It's impossible to have uncles outside of fork mode
@@ -1242,7 +1303,7 @@ impl EthApi {
         Err(BlockchainError::RpcUnimplemented)
     }
 
-    /// Introduced in EIP-1159 for getting information on the appropriate priority fee to use.
+    /// Introduced in EIP-1559 for getting information on the appropriate priority fee to use.
     ///
     /// Handler for ETH RPC call: `eth_feeHistory`
     pub async fn fee_history(
@@ -1351,7 +1412,22 @@ impl EthApi {
     /// Handler for ETH RPC call: `eth_maxPriorityFeePerGas`
     pub fn max_priority_fee_per_gas(&self) -> Result<U256> {
         node_info!("eth_maxPriorityFeePerGas");
-        Ok(U256::from(self.backend.max_priority_fee_per_gas()))
+        Ok(U256::from(self.lowest_suggestion_tip()))
+    }
+
+    /// Returns the suggested fee cap.
+    ///
+    /// Returns at least [MIN_SUGGESTED_PRIORITY_FEE]
+    fn lowest_suggestion_tip(&self) -> u128 {
+        let block_number = self.backend.best_number();
+        let latest_cached_block = self.fee_history_cache.lock().get(&block_number).cloned();
+
+        match latest_cached_block {
+            Some(block) => block.rewards.iter().copied().min(),
+            None => self.fee_history_cache.lock().values().flat_map(|b| b.rewards.clone()).min(),
+        }
+        .map(|fee| fee.max(MIN_SUGGESTED_PRIORITY_FEE))
+        .unwrap_or(MIN_SUGGESTED_PRIORITY_FEE)
     }
 
     /// Creates a filter object, based on filter options, to notify when the state changes (logs).
@@ -1419,6 +1495,44 @@ impl EthApi {
         Ok(self.filters.uninstall_filter(id).await.is_some())
     }
 
+    /// Returns EIP-2718 encoded raw transaction
+    ///
+    /// Handler for RPC call: `debug_getRawTransaction`
+    pub async fn raw_transaction(&self, hash: B256) -> Result<Option<Bytes>> {
+        node_info!("debug_getRawTransaction");
+        self.inner_raw_transaction(hash).await
+    }
+
+    /// Returns EIP-2718 encoded raw transaction by block hash and index
+    ///
+    /// Handler for RPC call: `eth_getRawTransactionByBlockHashAndIndex`
+    pub async fn raw_transaction_by_block_hash_and_index(
+        &self,
+        block_hash: B256,
+        index: Index,
+    ) -> Result<Option<Bytes>> {
+        node_info!("eth_getRawTransactionByBlockHashAndIndex");
+        match self.backend.transaction_by_block_hash_and_index(block_hash, index).await? {
+            Some(tx) => self.inner_raw_transaction(tx.hash).await,
+            None => Ok(None),
+        }
+    }
+
+    /// Returns EIP-2718 encoded raw transaction by block number and index
+    ///
+    /// Handler for RPC call: `eth_getRawTransactionByBlockNumberAndIndex`
+    pub async fn raw_transaction_by_block_number_and_index(
+        &self,
+        block_number: BlockNumber,
+        index: Index,
+    ) -> Result<Option<Bytes>> {
+        node_info!("eth_getRawTransactionByBlockNumberAndIndex");
+        match self.backend.transaction_by_block_number_and_index(block_number, index).await? {
+            Some(tx) => self.inner_raw_transaction(tx.hash).await,
+            None => Ok(None),
+        }
+    }
+
     /// Returns traces for the transaction hash for geth's tracing endpoint
     ///
     /// Handler for RPC call: `debug_traceTransaction`
@@ -1438,8 +1552,8 @@ impl EthApi {
         &self,
         request: WithOtherFields<TransactionRequest>,
         block_number: Option<BlockId>,
-        opts: GethDefaultTracingOptions,
-    ) -> Result<DefaultFrame> {
+        opts: GethDebugTracingCallOptions,
+    ) -> Result<GethTrace> {
         node_info!("debug_traceCall");
         let block_request = self.block_request(block_number).await?;
         let fees = FeeDetails::new(
@@ -1450,7 +1564,9 @@ impl EthApi {
         )?
         .or_zero_fees();
 
-        self.backend.call_with_tracing(request, fees, Some(block_request), opts).await
+        let result: std::result::Result<GethTrace, BlockchainError> =
+            self.backend.call_with_tracing(request, fees, Some(block_request), opts).await;
+        result
     }
 
     /// Returns traces for the transaction hash via parity's tracing endpoint
@@ -1468,6 +1584,17 @@ impl EthApi {
         node_info!("trace_block");
         self.backend.trace_block(block).await
     }
+
+    /// Returns filtered traces over blocks
+    ///
+    /// Handler for RPC call: `trace_filter`
+    pub async fn trace_filter(
+        &self,
+        filter: TraceFilter,
+    ) -> Result<Vec<LocalizedTransactionTrace>> {
+        node_info!("trace_filter");
+        self.backend.trace_filter(filter).await
+    }
 }
 
 // == impl EthApi anvil endpoints ==
@@ -1478,7 +1605,7 @@ impl EthApi {
     /// Handler for ETH RPC call: `anvil_impersonateAccount`
     pub async fn anvil_impersonate_account(&self, address: Address) -> Result<()> {
         node_info!("anvil_impersonateAccount");
-        self.backend.impersonate(address).await?;
+        self.backend.impersonate(address);
         Ok(())
     }
 
@@ -1487,7 +1614,7 @@ impl EthApi {
     /// Handler for ETH RPC call: `anvil_stopImpersonatingAccount`
     pub async fn anvil_stop_impersonating_account(&self, address: Address) -> Result<()> {
         node_info!("anvil_stopImpersonatingAccount");
-        self.backend.stop_impersonating(address).await?;
+        self.backend.stop_impersonating(address);
         Ok(())
     }
 
@@ -1496,7 +1623,7 @@ impl EthApi {
     /// Handler for ETH RPC call: `anvil_autoImpersonateAccount`
     pub async fn anvil_auto_impersonate_account(&self, enabled: bool) -> Result<()> {
         node_info!("anvil_autoImpersonateAccount");
-        self.backend.auto_impersonate_account(enabled).await;
+        self.backend.auto_impersonate_account(enabled);
         Ok(())
     }
 
@@ -1730,21 +1857,22 @@ impl EthApi {
         let env = self.backend.env().read();
         let fork_config = self.backend.get_fork();
         let tx_order = self.transaction_order.read();
+        let hard_fork: &str = env.handler_cfg.spec_id.into();
 
         Ok(NodeInfo {
-            current_block_number: U64::from(self.backend.best_number()),
+            current_block_number: self.backend.best_number(),
             current_block_timestamp: env.block.timestamp.try_into().unwrap_or(u64::MAX),
             current_block_hash: self.backend.best_hash(),
-            hard_fork: env.handler_cfg.spec_id,
+            hard_fork: hard_fork.to_string(),
             transaction_order: match *tx_order {
                 TransactionOrder::Fifo => "fifo".to_string(),
                 TransactionOrder::Fees => "fees".to_string(),
             },
             environment: NodeEnvironment {
-                base_fee: self.backend.base_fee(),
+                base_fee: U256::from(self.backend.base_fee()),
                 chain_id: self.backend.chain_id().to::<u64>(),
-                gas_limit: self.backend.gas_limit(),
-                gas_price: self.backend.gas_price(),
+                gas_limit: U256::from(self.backend.gas_limit()),
+                gas_price: U256::from(self.gas_price()),
             },
             fork_config: fork_config
                 .map(|fork| {
@@ -1763,13 +1891,13 @@ impl EthApi {
     /// Retrieves metadata about the Anvil instance.
     ///
     /// Handler for RPC call: `anvil_metadata`
-    pub async fn anvil_metadata(&self) -> Result<AnvilMetadata> {
+    pub async fn anvil_metadata(&self) -> Result<Metadata> {
         node_info!("anvil_metadata");
         let fork_config = self.backend.get_fork();
         let snapshots = self.backend.list_snapshots();
 
-        Ok(AnvilMetadata {
-            client_version: CLIENT_VERSION,
+        Ok(Metadata {
+            client_version: CLIENT_VERSION.to_string(),
             chain_id: self.backend.chain_id().to::<u64>(),
             latest_block_hash: self.backend.best_hash(),
             latest_block_number: self.backend.best_number(),
@@ -1868,7 +1996,7 @@ impl EthApi {
     ///
     /// This will mine the blocks regardless of the configured mining mode.
     /// **Note**: ganache returns `0x0` here as placeholder for additional meta-data in the future.
-    pub async fn evm_mine(&self, opts: Option<EvmMineOptions>) -> Result<String> {
+    pub async fn evm_mine(&self, opts: Option<MineOptions>) -> Result<String> {
         node_info!("evm_mine");
 
         self.do_evm_mine(opts).await?;
@@ -1885,7 +2013,7 @@ impl EthApi {
     /// **Note**: This behaves exactly as [Self::evm_mine] but returns different output, for
     /// compatibility reasons, this is a separate call since `evm_mine` is not an anvil original.
     /// and `ganache` may change the `0x0` placeholder.
-    pub async fn evm_mine_detailed(&self, opts: Option<EvmMineOptions>) -> Result<Vec<Block>> {
+    pub async fn evm_mine_detailed(&self, opts: Option<MineOptions>) -> Result<Vec<Block>> {
         node_info!("evm_mine_detailed");
 
         let mined_blocks = self.do_evm_mine(opts).await?;
@@ -1906,7 +2034,14 @@ impl EthApi {
                     if let Some(receipt) = self.backend.mined_transaction_receipt(tx.hash) {
                         if let Some(output) = receipt.out {
                             // insert revert reason if failure
-                            if !receipt.inner.inner.as_receipt_with_bloom().receipt.status {
+                            if !receipt
+                                .inner
+                                .inner
+                                .as_receipt_with_bloom()
+                                .receipt
+                                .status
+                                .coerce_status()
+                            {
                                 if let Some(reason) =
                                     RevertDecoder::new().maybe_decode(&output, None)
                                 {
@@ -1989,7 +2124,7 @@ impl EthApi {
 
         let request = self.build_typed_tx_request(request, nonce)?;
 
-        let bypass_signature = self.backend.cheats().bypass_signature();
+        let bypass_signature = self.impersonated_signature(&request);
         let transaction = sign::build_typed_transaction(request, bypass_signature)?;
 
         self.ensure_typed_transaction_supported(&transaction)?;
@@ -2093,8 +2228,6 @@ impl EthApi {
     }
 }
 
-// === impl EthApi utility functions ===
-
 impl EthApi {
     /// Executes the future on a new blocking task.
     async fn on_blocking_task<C, F, R>(&self, c: C) -> Result<R>
@@ -2116,13 +2249,13 @@ impl EthApi {
     }
 
     /// Executes the `evm_mine` and returns the number of blocks mined
-    async fn do_evm_mine(&self, opts: Option<EvmMineOptions>) -> Result<u64> {
+    async fn do_evm_mine(&self, opts: Option<MineOptions>) -> Result<u64> {
         let mut blocks_to_mine = 1u64;
 
         if let Some(opts) = opts {
             let timestamp = match opts {
-                EvmMineOptions::Timestamp(timestamp) => timestamp,
-                EvmMineOptions::Options { timestamp, blocks } => {
+                MineOptions::Timestamp(timestamp) => timestamp,
+                MineOptions::Options { timestamp, blocks } => {
                     if let Some(blocks) = blocks {
                         blocks_to_mine = blocks;
                     }
@@ -2179,7 +2312,7 @@ impl EthApi {
 
     /// Estimates the gas usage of the `request` with the state.
     ///
-    /// This will execute the [CallRequest] and find the best gas limit via binary search
+    /// This will execute the transaction request and find the best gas limit via binary search.
     fn do_estimate_gas_with_state<D>(
         &self,
         mut request: WithOtherFields<TransactionRequest>,
@@ -2427,7 +2560,7 @@ impl EthApi {
                 m.chain_id = Some(chain_id);
                 m.gas_limit = gas_limit;
                 if gas_price.is_none() {
-                    m.gas_price = self.backend.gas_price()
+                    m.gas_price = self.gas_price();
                 }
                 TypedTransactionRequest::Legacy(m)
             }
@@ -2436,7 +2569,7 @@ impl EthApi {
                 m.chain_id = chain_id;
                 m.gas_limit = gas_limit;
                 if gas_price.is_none() {
-                    m.gas_price = self.backend.gas_price();
+                    m.gas_price = self.gas_price();
                 }
                 TypedTransactionRequest::EIP2930(m)
             }
@@ -2445,7 +2578,7 @@ impl EthApi {
                 m.chain_id = chain_id;
                 m.gas_limit = gas_limit;
                 if max_fee_per_gas.is_none() {
-                    m.max_fee_per_gas = self.backend.gas_price();
+                    m.max_fee_per_gas = self.gas_price();
                 }
                 TypedTransactionRequest::EIP1559(m)
             }
@@ -2457,8 +2590,7 @@ impl EthApi {
                         m.tx.chain_id = chain_id;
                         m.tx.gas_limit = gas_limit;
                         if max_fee_per_gas.is_none() {
-                            m.tx.max_fee_per_gas =
-                                self.gas_price().unwrap_or_default().to::<u128>();
+                            m.tx.max_fee_per_gas = self.gas_price();
                         }
                         if max_fee_per_blob_gas.is_none() {
                             m.tx.max_fee_per_blob_gas = self
@@ -2489,6 +2621,28 @@ impl EthApi {
         self.backend.cheats().is_impersonated(addr)
     }
 
+    /// The signature used to bypass signing via the `eth_sendUnsignedTransaction` cheat RPC
+    fn impersonated_signature(&self, request: &TypedTransactionRequest) -> Signature {
+        match request {
+            // Only the legacy transaction type requires v to be in {27, 28}, thus
+            // requiring the use of Parity::NonEip155
+            TypedTransactionRequest::Legacy(_) => Signature::from_scalars_and_parity(
+                B256::with_last_byte(1),
+                B256::with_last_byte(1),
+                Parity::NonEip155(false),
+            ),
+            TypedTransactionRequest::EIP2930(_) |
+            TypedTransactionRequest::EIP1559(_) |
+            TypedTransactionRequest::EIP4844(_) |
+            TypedTransactionRequest::Deposit(_) => Signature::from_scalars_and_parity(
+                B256::with_last_byte(1),
+                B256::with_last_byte(1),
+                Parity::Parity(false),
+            ),
+        }
+        .unwrap()
+    }
+
     /// Returns the nonce of the `address` depending on the `block_number`
     async fn get_transaction_count(
         &self,
@@ -2500,7 +2654,7 @@ impl EthApi {
         if let BlockRequest::Number(number) = block_request {
             if let Some(fork) = self.get_fork() {
                 if fork.predates_fork_inclusive(number) {
-                    return Ok(fork.get_nonce(address, number).await?);
+                    return Ok(fork.get_nonce(address, number).await?)
                 }
             }
         }
@@ -2554,6 +2708,7 @@ impl EthApi {
             TypedTransaction::EIP2930(_) => self.backend.ensure_eip2930_active(),
             TypedTransaction::EIP1559(_) => self.backend.ensure_eip1559_active(),
             TypedTransaction::EIP4844(_) => self.backend.ensure_eip4844_active(),
+            TypedTransaction::EIP7702(_) => self.backend.ensure_eip7702_active(),
             TypedTransaction::Deposit(_) => self.backend.ensure_op_deposits_active(),
             TypedTransaction::Legacy(_) => Ok(()),
         }
@@ -2591,7 +2746,6 @@ fn ensure_return_ok(exit: InstructionResult, out: &Option<Output>) -> Result<Byt
 }
 
 /// Determines the minimum gas needed for a transaction depending on the transaction kind.
-#[inline]
 fn determine_base_gas_by_kind(request: &WithOtherFields<TransactionRequest>) -> u128 {
     match transaction_request_to_typed(request.clone()) {
         Some(request) => match request {
@@ -2627,7 +2781,7 @@ enum GasEstimationCallResult {
     EvmError(InstructionResult),
 }
 
-/// Converts the result of a call to revm EVM into a [GasEstimationCallRes].
+/// Converts the result of a call to revm EVM into a [`GasEstimationCallResult`].
 impl TryFrom<Result<(InstructionResult, Option<Output>, u128, State)>> for GasEstimationCallResult {
     type Error = BlockchainError;
 
@@ -2652,6 +2806,8 @@ impl TryFrom<Result<(InstructionResult, Option<Output>, u128, State)>> for GasEs
                 InstructionResult::OpcodeNotFound |
                 InstructionResult::CallNotAllowedInsideStatic |
                 InstructionResult::StateChangeDuringStaticCall |
+                InstructionResult::InvalidExtDelegateCallTarget |
+                InstructionResult::InvalidEXTCALLTarget |
                 InstructionResult::InvalidFEOpcode |
                 InstructionResult::InvalidJump |
                 InstructionResult::NotActivated |
@@ -2668,6 +2824,15 @@ impl TryFrom<Result<(InstructionResult, Option<Output>, u128, State)>> for GasEs
                 InstructionResult::FatalExternalError |
                 InstructionResult::OutOfFunds |
                 InstructionResult::CallTooDeep => Ok(Self::EvmError(exit)),
+
+                // Handle Revm EOF InstructionResults: Not supported yet
+                InstructionResult::ReturnContractInNotInitEOF |
+                InstructionResult::EOFOpcodeDisabledInLegacy |
+                InstructionResult::EOFFunctionStackOverflow |
+                InstructionResult::CreateInitCodeStartingEF00 |
+                InstructionResult::InvalidEOFInitCode |
+                InstructionResult::EofAuxDataOverflow |
+                InstructionResult::EofAuxDataTooSmall => Ok(Self::EvmError(exit)),
             },
         }
     }

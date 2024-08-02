@@ -259,18 +259,28 @@ pub enum CastSubcommand {
     },
 
     /// RLP encodes hex data, or an array of hex data.
+    ///
+    /// Accepts a hex-encoded string, or an array of hex-encoded strings.
+    /// Can be arbitrarily recursive.
+    ///
+    /// Examples:
+    /// - `cast to-rlp "[]"` -> `0xc0`
+    /// - `cast to-rlp "0x22"` -> `0x22`
+    /// - `cast to-rlp "[\"0x61\"]"` -> `0xc161`
+    /// - `cast to-rlp "[\"0xf1\", \"f2\"]"` -> `0xc481f181f2`
     #[command(visible_aliases = &["--to-rlp"])]
     ToRlp {
         /// The value to convert.
+        ///
+        /// This is a hex-encoded string, or an array of hex-encoded strings.
+        /// Can be arbitrarily recursive.
         value: Option<String>,
     },
 
-    /// Decodes RLP encoded data.
-    ///
-    /// Input must be hexadecimal.
+    /// Decodes RLP hex-encoded data.
     #[command(visible_aliases = &["--from-rlp"])]
     FromRlp {
-        /// The value to convert.
+        /// The RLP hex-encoded data.
         value: Option<String>,
     },
 
@@ -330,6 +340,8 @@ pub enum CastSubcommand {
     /// Get the latest block number.
     #[command(visible_alias = "bn")]
     BlockNumber {
+        /// The hash or tag to query. If not specified, the latest number is returned.
+        block: Option<BlockId>,
         #[command(flatten)]
         rpc: RpcOpts,
     },
@@ -478,6 +490,10 @@ pub enum CastSubcommand {
 
         /// The ABI-encoded calldata.
         calldata: String,
+
+        /// Print the decoded calldata as JSON.
+        #[arg(long, short, help_heading = "Display options")]
+        json: bool,
     },
 
     /// Decode ABI-encoded input or output data.
@@ -496,6 +512,10 @@ pub enum CastSubcommand {
         /// Whether to decode the input or output data.
         #[arg(long, short, help_heading = "Decode input data instead of output data")]
         input: bool,
+
+        /// Print the decoded calldata as JSON.
+        #[arg(long, short, help_heading = "Display options")]
+        json: bool,
     },
 
     /// ABI encode the given function argument, excluding the selector.
@@ -524,6 +544,16 @@ pub enum CastSubcommand {
 
         /// The storage slot of the mapping.
         slot_number: String,
+    },
+
+    /// Compute storage slots as specified by `ERC-7201: Namespaced Storage Layout`.
+    #[command(name = "index-erc7201", alias = "index-erc-7201", visible_aliases = &["index7201", "in7201"])]
+    IndexErc7201 {
+        /// The arbitrary identifier.
+        id: Option<String>,
+        /// The formula ID. Currently the only supported formula is `erc7201`.
+        #[arg(long, default_value = "erc7201")]
+        formula_id: String,
     },
 
     /// Fetch the EIP-1967 implementation account
@@ -572,6 +602,10 @@ pub enum CastSubcommand {
     FourByteDecode {
         /// The ABI-encoded calldata.
         calldata: Option<String>,
+
+        /// Print the decoded calldata as JSON.
+        #[arg(long, short, help_heading = "Display options")]
+        json: bool,
     },
 
     /// Get the event signature for a given topic 0 from https://openchain.xyz.
@@ -714,7 +748,7 @@ pub enum CastSubcommand {
     },
 
     /// Hash arbitrary data using Keccak-256.
-    #[command(visible_alias = "k")]
+    #[command(visible_aliases = &["k", "keccak256"])]
     Keccak {
         /// The data to hash.
         data: Option<String>,
@@ -796,8 +830,12 @@ pub enum CastSubcommand {
         /// The contract's address.
         address: String,
 
-        /// The output directory to expand source tree into.
-        #[arg(short, value_hint = ValueHint::DirPath)]
+        /// Whether to flatten the source code.
+        #[arg(long, short)]
+        flatten: bool,
+
+        /// The output directory/file to expand source tree into.
+        #[arg(short, value_hint = ValueHint::DirPath, alias = "path")]
         directory: Option<PathBuf>,
 
         #[command(flatten)]
@@ -879,7 +917,7 @@ pub enum CastSubcommand {
     },
 
     /// Decodes a raw signed EIP 2718 typed transaction
-    #[command(visible_alias = "dt")]
+    #[command(visible_aliases = &["dt", "decode-tx"])]
     DecodeTransaction { tx: Option<String> },
 
     /// Extracts function selectors and arguments from bytecode
@@ -892,6 +930,10 @@ pub enum CastSubcommand {
         #[arg(long, short)]
         resolve: bool,
     },
+
+    /// Decodes EOF container bytes
+    #[command()]
+    DecodeEof { eof: Option<String> },
 }
 
 /// CLI arguments for `cast --to-base`.

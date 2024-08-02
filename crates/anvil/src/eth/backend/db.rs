@@ -1,12 +1,18 @@
 //! Helper types for working with [revm](foundry_evm::revm)
 
-use crate::revm::primitives::AccountInfo;
+use crate::{mem::storage::MinedTransaction, revm::primitives::AccountInfo};
+use alloy_consensus::Header;
 use alloy_primitives::{keccak256, Address, Bytes, B256, U256, U64};
 use alloy_rpc_types::BlockId;
+use anvil_core::eth::{
+    block::Block,
+    transaction::{MaybeImpersonatedTransaction, TransactionInfo, TypedReceipt},
+};
 use foundry_common::errors::FsPathError;
 use foundry_evm::{
-    backend::{DatabaseError, DatabaseResult, MemDb, RevertSnapshotAction, StateSnapshot},
-    fork::BlockchainDb,
+    backend::{
+        BlockchainDb, DatabaseError, DatabaseResult, MemDb, RevertSnapshotAction, StateSnapshot,
+    },
     revm::{
         db::{CacheDB, DatabaseRef, DbAccount},
         primitives::{BlockEnv, Bytecode, HashMap, KECCAK_EMPTY},
@@ -100,7 +106,7 @@ pub trait Db:
             B256::from_slice(&keccak256(code.as_ref())[..])
         };
         info.code_hash = code_hash;
-        info.code = Some(Bytecode::new_raw(alloy_primitives::Bytes(code.0)).to_checked());
+        info.code = Some(Bytecode::new_raw(alloy_primitives::Bytes(code.0)));
         self.insert_account(address, info);
         Ok(())
     }
@@ -116,6 +122,8 @@ pub trait Db:
         &self,
         at: BlockEnv,
         best_number: U64,
+        blocks: Vec<SerializableBlock>,
+        transactions: Vec<SerializableTransaction>,
     ) -> DatabaseResult<Option<SerializableState>>;
 
     /// Deserialize and add all chain data to the backend storage
@@ -137,9 +145,7 @@ pub trait Db:
                     code: if account.code.0.is_empty() {
                         None
                     } else {
-                        Some(
-                            Bytecode::new_raw(alloy_primitives::Bytes(account.code.0)).to_checked(),
-                        )
+                        Some(Bytecode::new_raw(alloy_primitives::Bytes(account.code.0)))
                     },
                     nonce,
                 },
@@ -190,6 +196,8 @@ impl<T: DatabaseRef<Error = DatabaseError> + Send + Sync + Clone + fmt::Debug> D
         &self,
         _at: BlockEnv,
         _best_number: U64,
+        _blocks: Vec<SerializableBlock>,
+        _transaction: Vec<SerializableTransaction>,
     ) -> DatabaseResult<Option<SerializableState>> {
         Ok(None)
     }
@@ -268,8 +276,6 @@ impl<T: DatabaseRef<Error = DatabaseError>> MaybeForkedDatabase for CacheDB<T> {
 /// Represents a state at certain point
 pub struct StateDb(pub(crate) Box<dyn MaybeFullDatabase + Send + Sync>);
 
-// === impl StateDB ===
-
 impl StateDb {
     pub fn new(db: impl MaybeFullDatabase + Send + Sync + 'static) -> Self {
         Self(Box::new(db))
@@ -290,7 +296,7 @@ impl DatabaseRef for StateDb {
         self.0.storage_ref(address, index)
     }
 
-    fn block_hash_ref(&self, number: U256) -> DatabaseResult<B256> {
+    fn block_hash_ref(&self, number: u64) -> DatabaseResult<B256> {
         self.0.block_hash_ref(number)
     }
 }
@@ -322,9 +328,11 @@ pub struct SerializableState {
     pub accounts: BTreeMap<Address, SerializableAccountRecord>,
     /// The best block number of the state, can be different from block number (Arbitrum chain).
     pub best_block_number: Option<U64>,
+    #[serde(default)]
+    pub blocks: Vec<SerializableBlock>,
+    #[serde(default)]
+    pub transactions: Vec<SerializableTransaction>,
 }
-
-// === impl SerializableState ===
 
 impl SerializableState {
     /// Loads the `Genesis` object from the given json file path
@@ -349,4 +357,61 @@ pub struct SerializableAccountRecord {
     pub balance: U256,
     pub code: Bytes,
     pub storage: BTreeMap<U256, U256>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SerializableBlock {
+    pub header: Header,
+    pub transactions: Vec<MaybeImpersonatedTransaction>,
+    pub ommers: Vec<Header>,
+}
+
+impl From<Block> for SerializableBlock {
+    fn from(block: Block) -> Self {
+        Self {
+            header: block.header,
+            transactions: block.transactions.into_iter().map(Into::into).collect(),
+            ommers: block.ommers.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<SerializableBlock> for Block {
+    fn from(block: SerializableBlock) -> Self {
+        Self {
+            header: block.header,
+            transactions: block.transactions.into_iter().map(Into::into).collect(),
+            ommers: block.ommers.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SerializableTransaction {
+    pub info: TransactionInfo,
+    pub receipt: TypedReceipt,
+    pub block_hash: B256,
+    pub block_number: u64,
+}
+
+impl From<MinedTransaction> for SerializableTransaction {
+    fn from(transaction: MinedTransaction) -> Self {
+        Self {
+            info: transaction.info,
+            receipt: transaction.receipt,
+            block_hash: transaction.block_hash,
+            block_number: transaction.block_number,
+        }
+    }
+}
+
+impl From<SerializableTransaction> for MinedTransaction {
+    fn from(transaction: SerializableTransaction) -> Self {
+        Self {
+            info: transaction.info,
+            receipt: transaction.receipt,
+            block_hash: transaction.block_hash,
+            block_number: transaction.block_number,
+        }
+    }
 }

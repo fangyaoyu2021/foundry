@@ -2,7 +2,7 @@
 
 use crate::{config::*, test_helpers::TEST_DATA_DEFAULT};
 use alloy_primitives::U256;
-use forge::{fuzz::CounterExample, TestOptions};
+use forge::fuzz::CounterExample;
 use foundry_test_utils::Filter;
 use std::collections::BTreeMap;
 
@@ -24,53 +24,61 @@ macro_rules! get_counterexample {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_invariant() {
-    let filter = Filter::new(".*", ".*", ".*fuzz/invariant/(target|targetAbi|common)");
-    let mut runner = TEST_DATA_DEFAULT.runner();
-    runner.test_options.invariant.failure_persist_dir =
-        Some(tempfile::tempdir().unwrap().into_path());
-    let results = runner.test_collect(&filter);
-
+async fn test_invariant_with_alias() {
+    let filter = Filter::new(".*", ".*", ".*fuzz/invariant/common/InvariantTest1.t.sol");
+    let results = TEST_DATA_DEFAULT.runner().test_collect(&filter);
     assert_multiple(
         &results,
-        BTreeMap::from([
-            (
-                "default/fuzz/invariant/common/InvariantHandlerFailure.t.sol:InvariantHandlerFailure",
-                vec![("statefulFuzz_BrokenInvariant()", true, None, None, None)],
-            ),
-            (
-                "default/fuzz/invariant/common/InvariantInnerContract.t.sol:InvariantInnerContract",
-                vec![(
-                    "invariantHideJesus()",
+        BTreeMap::from([(
+            "default/fuzz/invariant/common/InvariantTest1.t.sol:InvariantTest",
+            vec![
+                ("invariant_neverFalse()", false, Some("revert: false".into()), None, None),
+                (
+                    "statefulFuzz_neverFalseWithInvariantAlias()",
                     false,
-                    Some("revert: jesus betrayed".into()),
+                    Some("revert: false".into()),
                     None,
                     None,
-                )],
-            ),
-            (
-                "default/fuzz/invariant/common/InvariantReentrancy.t.sol:InvariantReentrancy",
-                vec![("invariantNotStolen()", true, None, None, None)],
-            ),
-            (
-                "default/fuzz/invariant/common/InvariantTest1.t.sol:InvariantTest",
-                vec![
-                    ("invariant_neverFalse()", false, Some("revert: false".into()), None, None),
-                    (
-                        "statefulFuzz_neverFalseWithInvariantAlias()",
-                        false,
-                        Some("revert: false".into()),
-                        None,
-                        None,
-                    ),
-                ],
-            ),
+                ),
+            ],
+        )]),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_invariant_filters() {
+    let mut runner = TEST_DATA_DEFAULT.runner();
+    runner.test_options.invariant.runs = 10;
+
+    // Contracts filter tests.
+    assert_multiple(
+        &runner.test_collect(&Filter::new(
+            ".*",
+            ".*",
+            ".*fuzz/invariant/target/(ExcludeContracts|TargetContracts).t.sol",
+        )),
+        BTreeMap::from([
             (
                 "default/fuzz/invariant/target/ExcludeContracts.t.sol:ExcludeContracts",
                 vec![("invariantTrueWorld()", true, None, None, None)],
             ),
             (
                 "default/fuzz/invariant/target/TargetContracts.t.sol:TargetContracts",
+                vec![("invariantTrueWorld()", true, None, None, None)],
+            ),
+        ]),
+    );
+
+    // Senders filter tests.
+    assert_multiple(
+        &runner.test_collect(&Filter::new(
+            ".*",
+            ".*",
+            ".*fuzz/invariant/target/(ExcludeSenders|TargetSenders).t.sol",
+        )),
+        BTreeMap::from([
+            (
+                "default/fuzz/invariant/target/ExcludeSenders.t.sol:ExcludeSenders",
                 vec![("invariantTrueWorld()", true, None, None, None)],
             ),
             (
@@ -83,24 +91,49 @@ async fn test_invariant() {
                     None,
                 )],
             ),
+        ]),
+    );
+
+    // Interfaces filter tests.
+    assert_multiple(
+        &runner.test_collect(&Filter::new(
+            ".*",
+            ".*",
+            ".*fuzz/invariant/target/TargetInterfaces.t.sol",
+        )),
+        BTreeMap::from([(
+            "default/fuzz/invariant/target/TargetInterfaces.t.sol:TargetWorldInterfaces",
+            vec![("invariantTrueWorld()", false, Some("revert: false world".into()), None, None)],
+        )]),
+    );
+
+    // Selectors filter tests.
+    assert_multiple(
+        &runner.test_collect(&Filter::new(
+            ".*",
+            ".*",
+            ".*fuzz/invariant/target/(ExcludeSelectors|TargetSelectors).t.sol",
+        )),
+        BTreeMap::from([
             (
-                "default/fuzz/invariant/target/TargetInterfaces.t.sol:TargetWorldInterfaces",
-                vec![(
-                    "invariantTrueWorld()",
-                    false,
-                    Some("revert: false world".into()),
-                    None,
-                    None,
-                )],
-            ),
-            (
-                "default/fuzz/invariant/target/ExcludeSenders.t.sol:ExcludeSenders",
-                vec![("invariantTrueWorld()", true, None, None, None)],
+                "default/fuzz/invariant/target/ExcludeSelectors.t.sol:ExcludeSelectors",
+                vec![("invariantFalseWorld()", true, None, None, None)],
             ),
             (
                 "default/fuzz/invariant/target/TargetSelectors.t.sol:TargetSelectors",
                 vec![("invariantTrueWorld()", true, None, None, None)],
             ),
+        ]),
+    );
+
+    // Artifacts filter tests.
+    assert_multiple(
+        &runner.test_collect(&Filter::new(
+            ".*",
+            ".*",
+            ".*fuzz/invariant/targetAbi/(ExcludeArtifacts|TargetArtifacts|TargetArtifactSelectors|TargetArtifactSelectors2).t.sol",
+        )),
+        BTreeMap::from([
             (
                 "default/fuzz/invariant/targetAbi/ExcludeArtifacts.t.sol:ExcludeArtifacts",
                 vec![("invariantShouldPass()", true, None, None, None)],
@@ -132,94 +165,6 @@ async fn test_invariant() {
                     None,
                 )],
             ),
-            (
-                "default/fuzz/invariant/common/InvariantShrinkWithAssert.t.sol:InvariantShrinkWithAssert",
-                vec![(
-                    "invariant_with_assert()",
-                    false,
-                    Some("<empty revert data>".into()),
-                    None,
-                    None,
-                )],
-            ),
-            (
-                "default/fuzz/invariant/common/InvariantShrinkWithAssert.t.sol:InvariantShrinkWithRequire",
-                vec![(
-                    "invariant_with_require()",
-                    false,
-                    Some("revert: wrong counter".into()),
-                    None,
-                    None,
-                )],
-            ),
-            (
-                "default/fuzz/invariant/common/InvariantPreserveState.t.sol:InvariantPreserveState",
-                vec![("invariant_preserve_state()", true, None, None, None)],
-            ),
-            (
-                "default/fuzz/invariant/common/InvariantCalldataDictionary.t.sol:InvariantCalldataDictionary",
-                vec![(
-                    "invariant_owner_never_changes()",
-                    false,
-                    Some("<empty revert data>".into()),
-                    None,
-                    None,
-                )],
-            ),
-            (
-                "default/fuzz/invariant/common/InvariantAssume.t.sol:InvariantAssume",
-                vec![("invariant_dummy()", true, None, None, None)],
-            ),
-            (
-                "default/fuzz/invariant/common/InvariantCustomError.t.sol:InvariantCustomError",
-                vec![("invariant_decode_error()", true, None, None, None)],
-            ),
-            (
-                "default/fuzz/invariant/target/FuzzedTargetContracts.t.sol:ExplicitTargetContract",
-                vec![("invariant_explicit_target()", true, None, None, None)],
-            ),
-            (
-                "default/fuzz/invariant/target/FuzzedTargetContracts.t.sol:DynamicTargetContract",
-                vec![("invariant_dynamic_targets()", true, None, None, None)],
-            ),
-            (
-                "default/fuzz/invariant/common/InvariantFixtures.t.sol:InvariantFixtures",
-                vec![(
-                    "invariant_target_not_compromised()",
-                    false,
-                    Some("<empty revert data>".into()),
-                    None,
-                    None,
-                )],
-            ),
-            (
-                "default/fuzz/invariant/common/InvariantShrinkBigSequence.t.sol:ShrinkBigSequenceTest",
-                vec![("invariant_shrink_big_sequence()", true, None, None, None)],
-            ),
-            (
-                "default/fuzz/invariant/common/InvariantShrinkFailOnRevert.t.sol:ShrinkFailOnRevertTest",
-                vec![("invariant_shrink_fail_on_revert()", true, None, None, None)],
-            ),
-            (
-                "default/fuzz/invariant/common/InvariantScrapeValues.t.sol:FindFromReturnValueTest",
-                vec![(
-                    "invariant_value_not_found()",
-                    false,
-                    Some("revert: value from return found".into()),
-                    None,
-                    None,
-                )],
-            ),
-            (
-                "default/fuzz/invariant/common/InvariantScrapeValues.t.sol:FindFromLogValueTest",
-                vec![(
-                    "invariant_value_not_found()",
-                    false,
-                    Some("revert: value from logs found".into()),
-                    None,
-                    None,
-                )],
-            )
         ]),
     );
 }
@@ -231,7 +176,6 @@ async fn test_invariant_override() {
     runner.test_options.invariant.fail_on_revert = false;
     runner.test_options.invariant.call_override = true;
     let results = runner.test_collect(&filter);
-
     assert_multiple(
         &results,
         BTreeMap::from([(
@@ -249,7 +193,6 @@ async fn test_invariant_fail_on_revert() {
     runner.test_options.invariant.runs = 1;
     runner.test_options.invariant.depth = 10;
     let results = runner.test_collect(&filter);
-
     assert_multiple(
         &results,
         BTreeMap::from([(
@@ -273,7 +216,6 @@ async fn test_invariant_storage() {
     runner.test_options.invariant.depth = 100 + (50 * cfg!(windows) as u32);
     runner.test_options.fuzz.seed = Some(U256::from(6u32));
     let results = runner.test_collect(&filter);
-
     assert_multiple(
         &results,
         BTreeMap::from([(
@@ -284,6 +226,25 @@ async fn test_invariant_storage() {
                 ("invariantChangeUint()", false, Some("changedUint".to_string()), None, None),
                 ("invariantPush()", false, Some("pushUint".to_string()), None, None),
             ],
+        )]),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_invariant_inner_contract() {
+    let filter = Filter::new(".*", ".*", ".*fuzz/invariant/common/InvariantInnerContract.t.sol");
+    let results = TEST_DATA_DEFAULT.runner().test_collect(&filter);
+    assert_multiple(
+        &results,
+        BTreeMap::from([(
+            "default/fuzz/invariant/common/InvariantInnerContract.t.sol:InvariantInnerContract",
+            vec![(
+                "invariantHideJesus()",
+                false,
+                Some("revert: jesus betrayed".into()),
+                None,
+                None,
+            )],
         )]),
     );
 }
@@ -324,27 +285,27 @@ async fn test_invariant_shrink() {
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(windows, ignore = "for some reason there's different rng")]
 async fn test_invariant_assert_shrink() {
-    let mut opts = TEST_DATA_DEFAULT.test_opts.clone();
-    opts.fuzz.seed = Some(U256::from(119u32));
-
-    // ensure assert and require shrinks to same sequence of 3 or less
-    test_shrink(opts.clone(), "InvariantShrinkWithAssert").await;
-    test_shrink(opts.clone(), "InvariantShrinkWithRequire").await;
+    // ensure assert shrinks to same sequence of 2 as require
+    check_shrink_sequence("invariant_with_assert", 2).await;
 }
 
-async fn test_shrink(opts: TestOptions, contract_pattern: &str) {
-    let filter = Filter::new(
-        ".*",
-        contract_pattern,
-        ".*fuzz/invariant/common/InvariantShrinkWithAssert.t.sol",
-    );
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(windows, ignore = "for some reason there's different rng")]
+async fn test_invariant_require_shrink() {
+    // ensure require shrinks to same sequence of 2 as assert
+    check_shrink_sequence("invariant_with_require", 2).await;
+}
+
+async fn check_shrink_sequence(test_pattern: &str, expected_len: usize) {
+    let filter =
+        Filter::new(test_pattern, ".*", ".*fuzz/invariant/common/InvariantShrinkWithAssert.t.sol");
     let mut runner = TEST_DATA_DEFAULT.runner();
-    runner.test_options = opts.clone();
+    runner.test_options.fuzz.seed = Some(U256::from(100u32));
 
     match get_counterexample!(runner, &filter) {
         CounterExample::Single(_) => panic!("CounterExample should be a sequence."),
         CounterExample::Sequence(sequence) => {
-            assert!(sequence.len() <= 3);
+            assert_eq!(sequence.len(), expected_len);
         }
     };
 }
@@ -352,15 +313,12 @@ async fn test_shrink(opts: TestOptions, contract_pattern: &str) {
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(windows, ignore = "for some reason there's different rng")]
 async fn test_shrink_big_sequence() {
-    let mut opts = TEST_DATA_DEFAULT.test_opts.clone();
-    opts.fuzz.seed = Some(U256::from(119u32));
-
     let filter =
         Filter::new(".*", ".*", ".*fuzz/invariant/common/InvariantShrinkBigSequence.t.sol");
     let mut runner = TEST_DATA_DEFAULT.runner();
-    runner.test_options = opts.clone();
+    runner.test_options.fuzz.seed = Some(U256::from(119u32));
     runner.test_options.invariant.runs = 1;
-    runner.test_options.invariant.depth = 500;
+    runner.test_options.invariant.depth = 1000;
 
     let initial_counterexample = runner
         .test_collect(&filter)
@@ -427,16 +385,13 @@ async fn test_shrink_big_sequence() {
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(windows, ignore = "for some reason there's different rng")]
 async fn test_shrink_fail_on_revert() {
-    let mut opts = TEST_DATA_DEFAULT.test_opts.clone();
-    opts.fuzz.seed = Some(U256::from(119u32));
-
     let filter =
         Filter::new(".*", ".*", ".*fuzz/invariant/common/InvariantShrinkFailOnRevert.t.sol");
     let mut runner = TEST_DATA_DEFAULT.runner();
-    runner.test_options = opts.clone();
+    runner.test_options.fuzz.seed = Some(U256::from(119u32));
     runner.test_options.invariant.fail_on_revert = true;
     runner.test_options.invariant.runs = 1;
-    runner.test_options.invariant.depth = 100;
+    runner.test_options.invariant.depth = 200;
 
     match get_counterexample!(runner, &filter) {
         CounterExample::Single(_) => panic!("CounterExample should be a sequence."),
@@ -603,8 +558,7 @@ async fn test_invariant_fixtures() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_invariant_scrape_values() {
     let filter = Filter::new(".*", ".*", ".*fuzz/invariant/common/InvariantScrapeValues.t.sol");
-    let mut runner = TEST_DATA_DEFAULT.runner();
-    let results = runner.test_collect(&filter);
+    let results = TEST_DATA_DEFAULT.runner().test_collect(&filter);
     assert_multiple(
         &results,
         BTreeMap::from([
@@ -630,4 +584,117 @@ async fn test_invariant_scrape_values() {
             ),
         ]),
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_invariant_roll_fork_handler() {
+    let filter = Filter::new(".*", ".*", ".*fuzz/invariant/common/InvariantRollFork.t.sol");
+    let mut runner = TEST_DATA_DEFAULT.runner();
+    runner.test_options.fuzz.seed = Some(U256::from(119u32));
+    let results = runner.test_collect(&filter);
+    assert_multiple(
+        &results,
+        BTreeMap::from([
+            (
+                "default/fuzz/invariant/common/InvariantRollFork.t.sol:InvariantRollForkBlockTest",
+                vec![(
+                    "invariant_fork_handler_block()",
+                    false,
+                    Some("revert: too many blocks mined".into()),
+                    None,
+                    None,
+                )],
+            ),
+            (
+                "default/fuzz/invariant/common/InvariantRollFork.t.sol:InvariantRollForkStateTest",
+                vec![(
+                    "invariant_fork_handler_state()",
+                    false,
+                    Some("revert: wrong supply".into()),
+                    None,
+                    None,
+                )],
+            ),
+        ]),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_invariant_excluded_senders() {
+    let filter = Filter::new(".*", ".*", ".*fuzz/invariant/common/InvariantExcludedSenders.t.sol");
+    let mut runner = TEST_DATA_DEFAULT.runner();
+    runner.test_options.invariant.fail_on_revert = true;
+    let results = runner.test_collect(&filter);
+    assert_multiple(
+        &results,
+        BTreeMap::from([(
+            "default/fuzz/invariant/common/InvariantExcludedSenders.t.sol:InvariantExcludedSendersTest",
+            vec![("invariant_check_sender()", true, None, None, None)],
+        )]),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_invariant_after_invariant() {
+    // Check failure on passing invariant and failed `afterInvariant` condition
+    let filter = Filter::new(".*", ".*", ".*fuzz/invariant/common/InvariantAfterInvariant.t.sol");
+    let results = TEST_DATA_DEFAULT.runner().test_collect(&filter);
+    assert_multiple(
+        &results,
+        BTreeMap::from([(
+            "default/fuzz/invariant/common/InvariantAfterInvariant.t.sol:InvariantAfterInvariantTest",
+            vec![
+                (
+                    "invariant_after_invariant_failure()",
+                    false,
+                    Some("revert: afterInvariant failure".into()),
+                    None,
+                    None,
+                ),
+                (
+                    "invariant_failure()",
+                    false,
+                    Some("revert: invariant failure".into()),
+                    None,
+                    None,
+                ),
+                ("invariant_success()", true, None, None, None),
+            ],
+        )]),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_invariant_selectors_weight() {
+    let filter = Filter::new(".*", ".*", ".*fuzz/invariant/common/InvariantSelectorsWeight.t.sol");
+    let mut runner = TEST_DATA_DEFAULT.runner();
+    runner.test_options.fuzz.seed = Some(U256::from(119u32));
+    runner.test_options.invariant.runs = 1;
+    runner.test_options.invariant.depth = 10;
+    let results = runner.test_collect(&filter);
+    assert_multiple(
+        &results,
+        BTreeMap::from([(
+            "default/fuzz/invariant/common/InvariantSelectorsWeight.t.sol:InvariantSelectorsWeightTest",
+            vec![("invariant_selectors_weight()", true, None, None, None)],
+        )]),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_no_reverts_in_counterexample() {
+    let filter =
+        Filter::new(".*", ".*", ".*fuzz/invariant/common/InvariantSequenceNoReverts.t.sol");
+    let mut runner = TEST_DATA_DEFAULT.runner();
+    runner.test_options.invariant.fail_on_revert = false;
+    // Use original counterexample to test sequence len.
+    runner.test_options.invariant.shrink_run_limit = 0;
+
+    match get_counterexample!(runner, &filter) {
+        CounterExample::Single(_) => panic!("CounterExample should be a sequence."),
+        CounterExample::Sequence(sequence) => {
+            // ensure original counterexample len is 10 (even without shrinking)
+            assert_eq!(sequence.len(), 10);
+        }
+    };
 }

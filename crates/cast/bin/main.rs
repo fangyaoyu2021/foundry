@@ -1,7 +1,7 @@
 #[macro_use]
 extern crate tracing;
 
-use alloy_primitives::{keccak256, Address, B256};
+use alloy_primitives::{hex, keccak256, Address, B256};
 use alloy_provider::Provider;
 use alloy_rpc_types::{BlockId, BlockNumberOrTag::Latest};
 use cast::{Cast, SimpleCast};
@@ -12,7 +12,7 @@ use foundry_cli::{handler, prompt, stdin, utils};
 use foundry_common::{
     abi::get_event,
     ens::{namehash, ProviderEnsExt},
-    fmt::{format_tokens, format_uint_exp},
+    fmt::{format_uint_exp, print_tokens},
     fs,
     selectors::{
         decode_calldata, decode_event_topic, decode_function_selector, decode_selectors,
@@ -163,10 +163,9 @@ async fn main() -> Result<()> {
         }
 
         // ABI encoding & decoding
-        CastSubcommand::AbiDecode { sig, calldata, input } => {
+        CastSubcommand::AbiDecode { sig, calldata, input, json } => {
             let tokens = SimpleCast::abi_decode(&sig, &calldata, input)?;
-            let tokens = format_tokens(&tokens);
-            tokens.for_each(|t| println!("{t}"));
+            print_tokens(&tokens, json)
         }
         CastSubcommand::AbiEncode { sig, packed, args } => {
             if !packed {
@@ -175,10 +174,9 @@ async fn main() -> Result<()> {
                 println!("{}", SimpleCast::abi_encode_packed(&sig, &args)?);
             }
         }
-        CastSubcommand::CalldataDecode { sig, calldata } => {
+        CastSubcommand::CalldataDecode { sig, calldata, json } => {
             let tokens = SimpleCast::calldata_decode(&sig, &calldata, true)?;
-            let tokens = format_tokens(&tokens);
-            tokens.for_each(|t| println!("{t}"));
+            print_tokens(&tokens, json)
         }
         CastSubcommand::CalldataEncode { sig, args } => {
             println!("{}", SimpleCast::calldata_encode(sig, &args)?);
@@ -253,10 +251,20 @@ async fn main() -> Result<()> {
                     .await?
             );
         }
-        CastSubcommand::BlockNumber { rpc } => {
+        CastSubcommand::BlockNumber { rpc, block } => {
             let config = Config::from(&rpc);
             let provider = utils::get_provider(&config)?;
-            println!("{}", Cast::new(provider).block_number().await?);
+            let number = match block {
+                Some(id) => provider
+                    .get_block(id, false.into())
+                    .await?
+                    .ok_or_else(|| eyre::eyre!("block {id:?} not found"))?
+                    .header
+                    .number
+                    .ok_or_else(|| eyre::eyre!("block {id:?} has no block number"))?,
+                None => Cast::new(provider).block_number().await?,
+            };
+            println!("{number}");
         }
         CastSubcommand::Chain { rpc } => {
             let config = Config::from(&rpc);
@@ -309,7 +317,7 @@ async fn main() -> Result<()> {
                 {
                     let resolved = match func_names {
                         Some(v) => v.join("|"),
-                        None => "".to_string(),
+                        None => String::new(),
                     };
                     println!("{selector}\t{arguments:max_args_len$}\t{resolved}");
                 }
@@ -327,6 +335,11 @@ async fn main() -> Result<()> {
         }
         CastSubcommand::Index { key_type, key, slot_number } => {
             println!("{}", SimpleCast::index(&key_type, &key, &slot_number)?);
+        }
+        CastSubcommand::IndexErc7201 { id, formula_id } => {
+            eyre::ensure!(formula_id == "erc7201", "unsupported formula ID: {formula_id}");
+            let id = stdin::unwrap_line(id)?;
+            println!("{}", foundry_common::erc7201(&id));
         }
         CastSubcommand::Implementation { block, who, rpc } => {
             let config = Config::from(&rpc);
@@ -351,7 +364,8 @@ async fn main() -> Result<()> {
             let provider = utils::get_provider(&config)?;
             let address = address.resolve(&provider).await?;
             let value = provider
-                .get_proof(address, slots.into_iter().collect(), block.unwrap_or(BlockId::latest()))
+                .get_proof(address, slots.into_iter().collect())
+                .block_id(block.unwrap_or_default())
                 .await?;
             println!("{}", serde_json::to_string(&value)?);
         }
@@ -409,7 +423,7 @@ async fn main() -> Result<()> {
                 println!("{sig}");
             }
         }
-        CastSubcommand::FourByteDecode { calldata } => {
+        CastSubcommand::FourByteDecode { calldata, json } => {
             let calldata = stdin::unwrap_line(calldata)?;
             let sigs = decode_calldata(&calldata).await?;
             sigs.iter().enumerate().for_each(|(i, sig)| println!("{}) \"{sig}\"", i + 1));
@@ -424,9 +438,7 @@ async fn main() -> Result<()> {
             };
 
             let tokens = SimpleCast::calldata_decode(sig, &calldata, true)?;
-            for token in format_tokens(&tokens) {
-                println!("{token}");
-            }
+            print_tokens(&tokens, json)
         }
         CastSubcommand::FourByteEvent { topic } => {
             let topic = stdin::unwrap_line(topic)?;
@@ -514,17 +526,20 @@ async fn main() -> Result<()> {
         CastSubcommand::RightShift { value, bits, base_in, base_out } => {
             println!("{}", SimpleCast::right_shift(&value, &bits, base_in.as_deref(), &base_out)?);
         }
-        CastSubcommand::EtherscanSource { address, directory, etherscan } => {
+        CastSubcommand::EtherscanSource { address, directory, etherscan, flatten } => {
             let config = Config::from(&etherscan);
             let chain = config.chain.unwrap_or_default();
             let api_key = config.get_etherscan_api_key(Some(chain)).unwrap_or_default();
-            match directory {
-                Some(dir) => {
+            match (directory, flatten) {
+                (Some(dir), false) => {
                     SimpleCast::expand_etherscan_source_to_directory(chain, address, api_key, dir)
                         .await?
                 }
-                None => {
+                (None, false) => {
                     println!("{}", SimpleCast::etherscan_source(chain, address, api_key).await?);
+                }
+                (dir, true) => {
+                    SimpleCast::etherscan_source_flatten(chain, address, api_key, dir).await?;
                 }
             }
         }
@@ -547,6 +562,10 @@ async fn main() -> Result<()> {
             let tx = SimpleCast::decode_raw_transaction(&tx)?;
 
             println!("{}", serde_json::to_string_pretty(&tx)?);
+        }
+        CastSubcommand::DecodeEof { eof } => {
+            let eof = stdin::unwrap_line(eof)?;
+            println!("{}", SimpleCast::decode_eof(&eof)?);
         }
     };
     Ok(())

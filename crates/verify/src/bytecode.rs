@@ -1,4 +1,5 @@
-use alloy_primitives::{Address, Bytes, U256};
+use alloy_dyn_abi::DynSolValue;
+use alloy_primitives::{hex, Address, Bytes, U256};
 use alloy_provider::Provider;
 use alloy_rpc_types::{BlockId, BlockNumberOrTag};
 use clap::{Parser, ValueHint};
@@ -8,20 +9,16 @@ use foundry_cli::{
     opts::EtherscanOpts,
     utils::{self, read_constructor_args_file, LoadConfig},
 };
-use foundry_common::{
-    compile::{ProjectCompiler, SkipBuildFilter, SkipBuildFilters},
-    provider::ProviderBuilder,
-};
+use foundry_common::{abi::encode_args, compile::ProjectCompiler, provider::ProviderBuilder};
 use foundry_compilers::{
-    artifacts::{BytecodeHash, BytecodeObject, CompactContractBytecode},
+    artifacts::{CompactContractBytecode, EvmVersion},
     info::ContractInfo,
-    Artifact, EvmVersion, SolcSparseFileFilter,
 };
-use foundry_config::{figment, impl_figment_convert, Chain, Config};
+use foundry_config::{figment, filter::SkipBuildFilter, impl_figment_convert, Chain, Config};
 use foundry_evm::{
     constants::DEFAULT_CREATE2_DEPLOYER, executors::TracingExecutor, utils::configure_tx_env,
 };
-use revm_primitives::{db::Database, EnvWithHandlerCfg, HandlerCfg, SpecId};
+use revm_primitives::{db::Database, EnvWithHandlerCfg, HandlerCfg};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::{fmt, path::PathBuf, str::FromStr};
@@ -45,23 +42,32 @@ pub struct VerifyBytecodeArgs {
     /// The constructor args to generate the creation code.
     #[clap(
         long,
-        conflicts_with = "constructor_args_path",
+        num_args(1..),
+        conflicts_with_all = &["constructor_args_path", "encoded_constructor_args"],
         value_name = "ARGS",
-        visible_alias = "encoded-constructor-args"
     )]
-    pub constructor_args: Option<String>,
+    pub constructor_args: Option<Vec<String>>,
+
+    /// The ABI-encoded constructor arguments.
+    #[arg(
+        long,
+        conflicts_with_all = &["constructor_args_path", "constructor_args"],
+        value_name = "HEX",
+    )]
+    pub encoded_constructor_args: Option<String>,
 
     /// The path to a file containing the constructor arguments.
-    #[clap(long, value_hint = ValueHint::FilePath, value_name = "PATH")]
+    #[arg(
+        long,
+        value_hint = ValueHint::FilePath,
+        value_name = "PATH",
+        conflicts_with_all = &["constructor_args", "encoded_constructor_args"]
+    )]
     pub constructor_args_path: Option<PathBuf>,
 
     /// The rpc url to use for verification.
     #[clap(short = 'r', long, value_name = "RPC_URL", env = "ETH_RPC_URL")]
     pub rpc_url: Option<String>,
-
-    /// Verfication Type: `full` or `partial`. Ref: https://docs.sourcify.dev/docs/full-vs-partial-match/
-    #[clap(long, default_value = "full", value_name = "TYPE")]
-    pub verification_type: VerificationType,
 
     #[clap(flatten)]
     pub etherscan_opts: EtherscanOpts,
@@ -88,14 +94,13 @@ impl figment::Provider for VerifyBytecodeArgs {
     fn data(
         &self,
     ) -> Result<figment::value::Map<figment::Profile, figment::value::Dict>, figment::Error> {
-        let mut dict = figment::value::Dict::new();
+        let mut dict = self.etherscan_opts.dict();
         if let Some(block) = &self.block {
             dict.insert("block".into(), figment::value::Value::serialize(block)?);
         }
         if let Some(rpc_url) = &self.rpc_url {
             dict.insert("eth_rpc_url".into(), rpc_url.to_string().into());
         }
-        dict.insert("verification_type".into(), self.verification_type.to_string().into());
 
         Ok(figment::value::Map::from([(Config::selected_profile(), dict)]))
     }
@@ -109,7 +114,7 @@ impl VerifyBytecodeArgs {
         let config = self.load_config_emit_warnings();
         let provider = ProviderBuilder::new(&config.get_rpc_url_or_localhost_http()?).build()?;
 
-        let code = provider.get_code_at(self.address, BlockId::latest()).await?;
+        let code = provider.get_code_at(self.address).await?;
         if code.is_empty() {
             eyre::bail!("No bytecode found at address {}", self.address);
         }
@@ -142,45 +147,10 @@ impl VerifyBytecodeArgs {
         };
         let etherscan = Client::new(chain, key)?;
 
-        // Get the constructor args using `source_code` endpoint
-        let source_code = etherscan.contract_source_code(self.address).await?;
-
-        // Check if the contract name matches
-        let name = source_code.items.first().map(|item| item.contract_name.to_owned());
-        if name.as_ref() != Some(&self.contract.name) {
-            eyre::bail!("Contract name mismatch");
-        }
-
-        // Get the constructor args from etherscan
-        let constructor_args = if let Some(args) = source_code.items.first() {
-            args.constructor_arguments.clone()
-        } else {
-            eyre::bail!("No constructor arguments found for contract at address {}", self.address);
-        };
-
-        // Get user provided constructor args
-        let provided_constructor_args = if let Some(args) = self.constructor_args.to_owned() {
-            args
-        } else if let Some(path) = self.constructor_args_path.to_owned() {
-            // Read from file
-            let res = read_constructor_args_file(path)?;
-            // Convert res to Bytes
-            res.join("")
-        } else {
-            constructor_args.to_string()
-        };
-
-        // Constructor args mismatch
-        if provided_constructor_args != constructor_args.to_string() && !self.json {
-            println!(
-                "{}",
-                "The provided constructor args do not match the constructor args from etherscan. This will result in a mismatch - Using the args from etherscan".red().bold(),
-            );
-        }
-
         // Get creation tx hash
         let creation_data = etherscan.contract_creation_data(self.address).await?;
 
+        trace!(creation_tx_hash = ?creation_data.transaction_hash);
         let mut transaction = provider
             .get_transaction_by_hash(creation_data.transaction_hash)
             .await
@@ -191,7 +161,7 @@ impl VerifyBytecodeArgs {
         let receipt = provider
             .get_transaction_receipt(creation_data.transaction_hash)
             .await
-            .or_else(|e| eyre::bail!("Couldn't fetch transacrion receipt from RPC: {:?}", e))?;
+            .or_else(|e| eyre::bail!("Couldn't fetch transaction receipt from RPC: {:?}", e))?;
 
         let receipt = if let Some(receipt) = receipt {
             receipt
@@ -201,61 +171,133 @@ impl VerifyBytecodeArgs {
                 creation_data.transaction_hash
             );
         };
-        // Extract creation code
-        let maybe_creation_code = if receipt.contract_address == Some(self.address) {
-            &transaction.input
-        } else if transaction.to == Some(DEFAULT_CREATE2_DEPLOYER) {
-            &transaction.input[32..]
-        } else {
-            eyre::bail!(
-                "Could not extract the creation code for contract at address {}",
-                self.address
-            );
-        };
 
-        // If bytecode_hash is disabled then its always partial verification
-        let (verification_type, has_metadata) =
-            match (&self.verification_type, config.bytecode_hash) {
-                (VerificationType::Full, BytecodeHash::None) => (VerificationType::Partial, false),
-                (VerificationType::Partial, BytecodeHash::None) => {
-                    (VerificationType::Partial, false)
-                }
-                (VerificationType::Full, _) => (VerificationType::Full, true),
-                (VerificationType::Partial, _) => (VerificationType::Partial, true),
+        // Extract creation code
+        let maybe_creation_code =
+            if receipt.to.is_none() && receipt.contract_address == Some(self.address) {
+                &transaction.input
+            } else if receipt.to == Some(DEFAULT_CREATE2_DEPLOYER) {
+                &transaction.input[32..]
+            } else {
+                eyre::bail!(
+                    "Could not extract the creation code for contract at address {}",
+                    self.address
+                );
             };
 
-        // Etherscan compilation metadata
+        // Get the constructor args using `source_code` endpoint
+        let source_code = etherscan.contract_source_code(self.address).await?;
+
+        // Check if the contract name matches
+        let name = source_code.items.first().map(|item| item.contract_name.to_owned());
+        if name.as_ref() != Some(&self.contract.name) {
+            eyre::bail!("Contract name mismatch");
+        }
+
+        // Obtain Etherscan compilation metadata
         let etherscan_metadata = source_code.items.first().unwrap();
 
-        let local_bytecode =
-            if let Some(local_bytecode) = self.build_using_cache(etherscan_metadata, &config) {
+        // Obtain local artifact
+        let artifact =
+            if let Ok(local_bytecode) = self.build_using_cache(etherscan_metadata, &config) {
+                trace!("using cache");
                 local_bytecode
             } else {
                 self.build_project(&config)?
             };
 
+        let local_bytecode = artifact
+            .bytecode
+            .and_then(|b| b.into_bytes())
+            .ok_or_eyre("Unlinked bytecode is not supported for verification")?;
+
+        // Get the constructor args from etherscan
+        let mut constructor_args = if let Some(args) = source_code.items.first() {
+            args.constructor_arguments.clone()
+        } else {
+            eyre::bail!("No constructor arguments found for contract at address {}", self.address);
+        };
+
+        // Get and encode user provided constructor args
+        let provided_constructor_args = if let Some(path) = self.constructor_args_path.to_owned() {
+            // Read from file
+            Some(read_constructor_args_file(path)?)
+        } else {
+            self.constructor_args.to_owned()
+        }
+        .map(|args| {
+            if let Some(constructor) = artifact.abi.as_ref().and_then(|abi| abi.constructor()) {
+                if constructor.inputs.len() != args.len() {
+                    eyre::bail!(
+                        "Mismatch of constructor arguments length. Expected {}, got {}",
+                        constructor.inputs.len(),
+                        args.len()
+                    );
+                }
+                encode_args(&constructor.inputs, &args)
+                    .map(|args| DynSolValue::Tuple(args).abi_encode())
+            } else {
+                Ok(Vec::new())
+            }
+        })
+        .transpose()?
+        .or(self.encoded_constructor_args.to_owned().map(hex::decode).transpose()?);
+
+        if let Some(provided) = provided_constructor_args {
+            constructor_args = provided.into();
+        } else {
+            // In some cases, Etherscan will return incorrect constructor arguments. If this
+            // happens, try extracting arguments ourselves.
+            if !maybe_creation_code.ends_with(&constructor_args) {
+                trace!("mismatch of constructor args with etherscan");
+                // If local bytecode is longer than on-chain one, this is probably not a match.
+                if maybe_creation_code.len() >= local_bytecode.len() {
+                    constructor_args =
+                        Bytes::copy_from_slice(&maybe_creation_code[local_bytecode.len()..]);
+                    trace!(
+                        "setting constructor args to latest {} bytes of bytecode",
+                        constructor_args.len()
+                    );
+                }
+            }
+        }
+
         // Append constructor args to the local_bytecode
+        trace!(%constructor_args);
         let mut local_bytecode_vec = local_bytecode.to_vec();
         local_bytecode_vec.extend_from_slice(&constructor_args);
 
         // Cmp creation code with locally built bytecode and maybe_creation_code
-        let (did_match, with_status) = try_match(
+        let match_type = match_bytecodes(
             local_bytecode_vec.as_slice(),
             maybe_creation_code,
             &constructor_args,
-            &verification_type,
             false,
-            has_metadata,
-        )?;
+        );
 
         let mut json_results: Vec<JsonResult> = vec![];
         self.print_result(
-            (did_match, with_status),
+            match_type,
             BytecodeType::Creation,
             &mut json_results,
             etherscan_metadata,
             &config,
         );
+
+        // If the creation code does not match, the runtime also won't match. Hence return.
+        if match_type.is_none() {
+            self.print_result(
+                None,
+                BytecodeType::Runtime,
+                &mut json_results,
+                etherscan_metadata,
+                &config,
+            );
+            if self.json {
+                println!("{}", serde_json::to_string(&json_results)?);
+            }
+            return Ok(());
+        }
 
         // Get contract creation block
         let simulation_block = match self.block {
@@ -284,15 +326,17 @@ impl VerifyBytecodeArgs {
             TracingExecutor::get_fork_material(&fork_config, evm_opts).await?;
 
         let mut executor =
-            TracingExecutor::new(env.clone(), fork, Some(fork_config.evm_version), false);
+            TracingExecutor::new(env.clone(), fork, Some(fork_config.evm_version), false, false);
         env.block.number = U256::from(simulation_block);
-        let block = provider.get_block(simulation_block.into(), true).await?;
+        let block = provider.get_block(simulation_block.into(), true.into()).await?;
 
         // Workaround for the NonceTooHigh issue as we're not simulating prior txs of the same
         // block.
-        let prev_block_id = BlockId::Number(BlockNumberOrTag::Number(simulation_block - 1));
-        let prev_block_nonce =
-            provider.get_transaction_count(creation_data.contract_creator, prev_block_id).await?;
+        let prev_block_id = BlockId::number(simulation_block - 1);
+        let prev_block_nonce = provider
+            .get_transaction_count(creation_data.contract_creator)
+            .block_id(prev_block_id)
+            .await?;
         transaction.nonce = prev_block_nonce;
 
         if let Some(ref block) = block {
@@ -304,19 +348,33 @@ impl VerifyBytecodeArgs {
             env.block.gas_limit = U256::from(block.header.gas_limit);
         }
 
+        // Replace the `input` with local creation code in the creation tx.
+        if let Some(to) = transaction.to {
+            if to == DEFAULT_CREATE2_DEPLOYER {
+                let mut input = transaction.input[..32].to_vec(); // Salt
+                input.extend_from_slice(&local_bytecode_vec);
+                transaction.input = Bytes::from(input);
+
+                // Deploy default CREATE2 deployer
+                executor.deploy_create2_deployer()?;
+            }
+        } else {
+            transaction.input = Bytes::from(local_bytecode_vec);
+        }
+
         configure_tx_env(&mut env, &transaction);
 
         let env_with_handler =
-            EnvWithHandlerCfg::new(Box::new(env.clone()), HandlerCfg::new(SpecId::LATEST));
+            EnvWithHandlerCfg::new(Box::new(env.clone()), HandlerCfg::new(config.evm_spec_id()));
 
         let contract_address = if let Some(to) = transaction.to {
             if to != DEFAULT_CREATE2_DEPLOYER {
                 eyre::bail!("Transaction `to` address is not the default create2 deployer i.e the tx is not a contract creation tx.");
             }
-            let result = executor.commit_tx_with_env(env_with_handler.to_owned())?;
+            let result = executor.transact_with_env(env_with_handler.clone())?;
 
-            if result.result.len() > 20 {
-                eyre::bail!("Failed to deploy contract using commit_tx_with_env on fork at block {} | Err: Call result is greater than 20 bytes, cannot be converted to Address", simulation_block);
+            if result.result.len() != 20 {
+                eyre::bail!("Failed to deploy contract on fork at block {simulation_block}: call result is not exactly 20 bytes");
             }
 
             Address::from_slice(&result.result)
@@ -327,7 +385,7 @@ impl VerifyBytecodeArgs {
 
         // State commited using deploy_with_env, now get the runtime bytecode from the db.
         let fork_runtime_code = executor
-            .backend
+            .backend_mut()
             .basic(contract_address)?
             .ok_or_else(|| {
                 eyre::eyre!(
@@ -343,22 +401,19 @@ impl VerifyBytecodeArgs {
                 )
             })?;
 
-        let onchain_runtime_code = provider
-            .get_code_at(self.address, BlockId::Number(BlockNumberOrTag::Number(simulation_block)))
-            .await?;
+        let onchain_runtime_code =
+            provider.get_code_at(self.address).block_id(BlockId::number(simulation_block)).await?;
 
-        // Compare the runtime bytecode with the locally built bytecode
-        let (did_match, with_status) = try_match(
-            &fork_runtime_code.bytecode,
+        // Compare the onchain runtime bytecode with the runtime code from the fork.
+        let match_type = match_bytecodes(
+            &fork_runtime_code.original_bytes(),
             &onchain_runtime_code,
             &constructor_args,
-            &verification_type,
             true,
-            has_metadata,
-        )?;
+        );
 
         self.print_result(
-            (did_match, with_status),
+            match_type,
             BytecodeType::Runtime,
             &mut json_results,
             etherscan_metadata,
@@ -371,114 +426,90 @@ impl VerifyBytecodeArgs {
         Ok(())
     }
 
-    fn build_project(&self, config: &Config) -> Result<Bytes> {
+    fn build_project(&self, config: &Config) -> Result<CompactContractBytecode> {
         let project = config.project()?;
-        let mut compiler = ProjectCompiler::new();
+        let compiler = ProjectCompiler::new();
 
-        if let Some(skip) = &self.skip {
-            if !skip.is_empty() {
-                let filter = SolcSparseFileFilter::new(SkipBuildFilters::new(
-                    skip.to_owned(),
-                    project.root().to_path_buf(),
-                )?);
-                compiler = compiler.filter(Box::new(filter));
-            }
-        }
-        let output = compiler.compile(&project)?;
+        let mut output = compiler.compile(&project)?;
 
         let artifact = output
-            .find_contract(&self.contract)
+            .remove_contract(&self.contract)
             .ok_or_eyre("Build Error: Contract artifact not found locally")?;
 
-        let local_bytecode = artifact
-            .get_bytecode_object()
-            .ok_or_eyre("Contract artifact does not have bytecode")?;
-
-        let local_bytecode = match local_bytecode.as_ref() {
-            BytecodeObject::Bytecode(bytes) => bytes,
-            BytecodeObject::Unlinked(_) => {
-                eyre::bail!("Unlinked bytecode is not supported for verification")
-            }
-        };
-
-        Ok(local_bytecode.to_owned())
+        Ok(artifact.into_contract_bytecode())
     }
 
-    fn build_using_cache(&self, etherscan_settings: &Metadata, config: &Config) -> Option<Bytes> {
-        let project = config.project().ok()?;
-        let cache = project.read_cache_file().ok()?;
-        let cached_artifacts = cache.read_artifacts::<CompactContractBytecode>().ok()?;
+    fn build_using_cache(
+        &self,
+        etherscan_settings: &Metadata,
+        config: &Config,
+    ) -> Result<CompactContractBytecode> {
+        let project = config.project()?;
+        let cache = project.read_cache_file()?;
+        let cached_artifacts = cache.read_artifacts::<CompactContractBytecode>()?;
 
         for (key, value) in cached_artifacts {
             let name = self.contract.name.to_owned() + ".sol";
             let version = etherscan_settings.compiler_version.to_owned();
+            // Ignores vyper
             if version.starts_with("vyper:") {
-                return None;
+                eyre::bail!("Vyper contracts are not supported")
             }
             // Parse etherscan version string
             let version =
                 version.split('+').next().unwrap_or("").trim_start_matches('v').to_string();
+
+            // Check if `out/directory` name matches the contract name
             if key.ends_with(name.as_str()) {
-                if let Some(artifact) = value.into_iter().next() {
+                let name = name.replace(".sol", ".json");
+                for artifact in value.into_values().flatten() {
+                    // Check if ABI file matches the name
+                    if !artifact.file.ends_with(&name) {
+                        continue;
+                    }
+
+                    // Check if Solidity version matches
                     if let Ok(version) = Version::parse(&version) {
-                        if let Some(artifact) = artifact.1.iter().find(|a| {
-                            a.version.major == version.major &&
-                                a.version.minor == version.minor &&
-                                a.version.patch == version.patch
-                        }) {
-                            return artifact
-                                .artifact
-                                .bytecode
-                                .as_ref()
-                                .and_then(|bytes| bytes.bytes().to_owned())
-                                .cloned();
+                        if !(artifact.version.major == version.major &&
+                            artifact.version.minor == version.minor &&
+                            artifact.version.patch == version.patch)
+                        {
+                            continue;
                         }
                     }
-                    let artifact = artifact.1.first().unwrap(); // Get the first artifact
-                    let local_bytecode = if let Some(local_bytecode) = &artifact.artifact.bytecode {
-                        local_bytecode.bytes()
-                    } else {
-                        None
-                    };
 
-                    return local_bytecode.map(|bytes| bytes.to_owned());
+                    return Ok(artifact.artifact)
                 }
             }
         }
 
-        None
+        eyre::bail!("couldn't find cached artifact for contract {}", self.contract.name)
     }
 
     fn print_result(
         &self,
-        res: (bool, Option<VerificationType>),
+        res: Option<VerificationType>,
         bytecode_type: BytecodeType,
         json_results: &mut Vec<JsonResult>,
         etherscan_config: &Metadata,
         config: &Config,
     ) {
-        if res.0 {
+        if let Some(res) = res {
             if !self.json {
                 println!(
                     "{} with status {}",
-                    format!("{:?} code matched", bytecode_type).green().bold(),
-                    res.1.unwrap().green().bold()
+                    format!("{bytecode_type:?} code matched").green().bold(),
+                    res.green().bold()
                 );
             } else {
-                let json_res = JsonResult {
-                    bytecode_type,
-                    matched: true,
-                    verification_type: res.1.unwrap(),
-                    message: None,
-                };
+                let json_res = JsonResult { bytecode_type, match_type: Some(res), message: None };
                 json_results.push(json_res);
             }
-        } else if !res.0 && !self.json {
+        } else if !self.json {
             println!(
                 "{}",
                 format!(
-                    "{:?} code did not match - this may be due to varying compiler settings",
-                    bytecode_type
+                    "{bytecode_type:?} code did not match - this may be due to varying compiler settings"
                 )
                 .red()
                 .bold()
@@ -487,14 +518,12 @@ impl VerifyBytecodeArgs {
             for mismatch in mismatches {
                 println!("{}", mismatch.red().bold());
             }
-        } else if !res.0 && self.json {
+        } else {
             let json_res = JsonResult {
                 bytecode_type,
-                matched: false,
-                verification_type: self.verification_type,
+                match_type: res,
                 message: Some(format!(
-                    "{:?} code did not match - this may be due to varying compiler settings",
-                    bytecode_type
+                    "{bytecode_type:?} code did not match - this may be due to varying compiler settings"
                 )),
             };
             json_results.push(json_res);
@@ -502,7 +531,8 @@ impl VerifyBytecodeArgs {
     }
 }
 
-/// Enum to represent the type of verification: `full` or `partial`. Ref: https://docs.sourcify.dev/docs/full-vs-partial-match/
+/// Enum to represent the type of verification: `full` or `partial`.
+/// Ref: <https://docs.sourcify.dev/docs/full-vs-partial-match/>
 #[derive(Debug, Clone, clap::ValueEnum, Default, PartialEq, Eq, Serialize, Deserialize, Copy)]
 pub enum VerificationType {
     #[default]
@@ -517,8 +547,8 @@ impl FromStr for VerificationType {
 
     fn from_str(s: &str) -> Result<Self> {
         match s {
-            "full" => Ok(VerificationType::Full),
-            "partial" => Ok(VerificationType::Partial),
+            "full" => Ok(Self::Full),
+            "partial" => Ok(Self::Partial),
             _ => eyre::bail!("Invalid verification type"),
         }
     }
@@ -536,8 +566,8 @@ impl From<VerificationType> for String {
 impl fmt::Display for VerificationType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            VerificationType::Full => write!(f, "full"),
-            VerificationType::Partial => write!(f, "partial"),
+            Self::Full => write!(f, "full"),
+            Self::Partial => write!(f, "partial"),
         }
     }
 }
@@ -554,78 +584,72 @@ pub enum BytecodeType {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct JsonResult {
     pub bytecode_type: BytecodeType,
-    pub matched: bool,
-    pub verification_type: VerificationType,
+    pub match_type: Option<VerificationType>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
 
-fn try_match(
+fn match_bytecodes(
     local_bytecode: &[u8],
     bytecode: &[u8],
     constructor_args: &[u8],
-    match_type: &VerificationType,
     is_runtime: bool,
-    has_metadata: bool,
-) -> Result<(bool, Option<VerificationType>)> {
+) -> Option<VerificationType> {
     // 1. Try full match
-    if *match_type == VerificationType::Full && local_bytecode.starts_with(bytecode) {
-        Ok((true, Some(VerificationType::Full)))
+    if local_bytecode == bytecode {
+        Some(VerificationType::Full)
     } else {
-        try_partial_match(local_bytecode, bytecode, constructor_args, is_runtime, has_metadata)
-            .map(|matched| (matched, matched.then_some(VerificationType::Partial)))
+        is_partial_match(local_bytecode, bytecode, constructor_args, is_runtime)
+            .then_some(VerificationType::Partial)
     }
 }
 
-fn try_partial_match(
+fn is_partial_match(
     mut local_bytecode: &[u8],
     mut bytecode: &[u8],
     constructor_args: &[u8],
     is_runtime: bool,
-    has_metadata: bool,
-) -> Result<bool> {
+) -> bool {
     // 1. Check length of constructor args
-    if constructor_args.is_empty() {
+    if constructor_args.is_empty() || is_runtime {
         // Assume metadata is at the end of the bytecode
-        if has_metadata {
-            local_bytecode = extract_metadata_hash(local_bytecode)?;
-            bytecode = extract_metadata_hash(bytecode)?;
-        }
-
-        // Now compare the creation code and bytecode
-        return Ok(local_bytecode.starts_with(bytecode));
-    }
-
-    if is_runtime {
-        if has_metadata {
-            local_bytecode = extract_metadata_hash(local_bytecode)?;
-            bytecode = extract_metadata_hash(bytecode)?;
-        }
-
-        // Now compare the local code and bytecode
-        return Ok(local_bytecode.starts_with(bytecode));
+        return try_extract_and_compare_bytecode(local_bytecode, bytecode)
     }
 
     // If not runtime, extract constructor args from the end of the bytecode
     bytecode = &bytecode[..bytecode.len() - constructor_args.len()];
     local_bytecode = &local_bytecode[..local_bytecode.len() - constructor_args.len()];
 
-    if has_metadata {
-        local_bytecode = extract_metadata_hash(local_bytecode)?;
-        bytecode = extract_metadata_hash(bytecode)?;
-    }
+    try_extract_and_compare_bytecode(local_bytecode, bytecode)
+}
 
-    Ok(local_bytecode.starts_with(bytecode))
+fn try_extract_and_compare_bytecode(mut local_bytecode: &[u8], mut bytecode: &[u8]) -> bool {
+    local_bytecode = extract_metadata_hash(local_bytecode);
+    bytecode = extract_metadata_hash(bytecode);
+
+    // Now compare the local code and bytecode
+    local_bytecode == bytecode
 }
 
 /// @dev This assumes that the metadata is at the end of the bytecode
-fn extract_metadata_hash(bytecode: &[u8]) -> Result<&[u8]> {
+fn extract_metadata_hash(bytecode: &[u8]) -> &[u8] {
     // Get the last two bytes of the bytecode to find the length of CBOR metadata
     let metadata_len = &bytecode[bytecode.len() - 2..];
     let metadata_len = u16::from_be_bytes([metadata_len[0], metadata_len[1]]);
 
-    // Now discard the metadata from the bytecode
-    Ok(&bytecode[..bytecode.len() - 2 - metadata_len as usize])
+    if metadata_len as usize <= bytecode.len() {
+        if ciborium::from_reader::<ciborium::Value, _>(
+            &bytecode[bytecode.len() - 2 - metadata_len as usize..bytecode.len() - 2],
+        )
+        .is_ok()
+        {
+            &bytecode[..bytecode.len() - 2 - metadata_len as usize]
+        } else {
+            bytecode
+        }
+    } else {
+        bytecode
+    }
 }
 
 fn find_mismatch_in_settings(
